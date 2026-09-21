@@ -158,6 +158,22 @@ impl Metadata {
     }
 }
 
+/// The configuration for the mordant linting tool.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct MordantTable {
+    baseline: Option<String>,
+    disabled: Vec<String>,
+}
+
+impl MordantTable {
+    fn unused_pub_off(&self) -> bool {
+        self.disabled
+            .iter()
+            .any(|name| name == "unused_pub" || name == "group:unused")
+    }
+}
+
 /// What `--message-format` asked for.
 enum Output {
     Human,
@@ -233,10 +249,11 @@ fn main() -> ExitCode {
             Err(err) => return fail(format_args!("could not read {}: {err}", path.display())),
         }
     };
-    let baseline = env::var(protocol::CONFIG_ENV)
+    let mordant_config = env::var(protocol::CONFIG_ENV)
         .ok()
         .or_else(|| config.clone())
-        .and_then(|text| baseline_name(&text));
+        .map(|text| mordant_config_table(&text))
+        .unwrap_or_default();
     let output = Output::take(&mut args);
     let styled = styled(option_value(&args, "--color"));
     let facts = meta.target_directory.join("mordant").join("unused_pub");
@@ -288,15 +305,19 @@ fn main() -> ExitCode {
             return exit_code(status, "cargo");
         }
     }
-    let errors = unused_pub::report(
-        &meta.workspace_root,
-        &facts,
-        &units,
-        &meta.judged(&args, &units),
-        &output,
-        styled,
-        baseline.as_deref(),
-    );
+    let errors = if mordant_config.unused_pub_off() {
+        false
+    } else {
+        unused_pub::report(
+            &meta.workspace_root,
+            &facts,
+            &units,
+            &meta.judged(&args, &units),
+            &output,
+            styled,
+            mordant_config.baseline.as_deref(),
+        )
+    };
     if let Some(finished) = &mut finished {
         finished["success"] = Json::Bool(!errors);
     }
@@ -316,11 +337,13 @@ fn print_finished(output: &Output, finished: Option<Json>) {
     }
 }
 
-/// The baseline file the configuration names, if it names one.
-fn baseline_name(config: &str) -> Option<String> {
-    let table: toml::Table = toml::from_str(config).ok()?;
-    let name = table.get("mordant")?.get("baseline")?.as_str()?;
-    Some(name.to_string())
+/// Parses the configuration table for the mordant linting tool.
+fn mordant_config_table(config: &str) -> MordantTable {
+    let mut table: toml::Table = toml::from_str(config).unwrap_or_default();
+    table
+        .remove("mordant")
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or_default()
 }
 
 /// Whether findings are printed in colour: as `--color` says, or as cargo's
