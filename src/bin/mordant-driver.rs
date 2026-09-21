@@ -28,7 +28,7 @@ use rustc_session::config::ErrorOutputType;
 use rustc_session::{EarlyDiagCtxt, Session};
 use rustc_span::Symbol;
 
-use mordant::protocol::{CONFIG_ENV, LIST_ARG};
+use mordant::protocol::{CONFIG_ENV, FACTS_ENV, LIST_ARG};
 
 /// Extra rustc flags for the linted crates only, split on whitespace:
 /// `MORDANT_RUSTFLAGS="-D warnings"`. `RUSTFLAGS` would also rebuild every
@@ -65,6 +65,12 @@ fn main() -> ExitCode {
             rustc_driver::run_compiler(&args, &mut PlainCallbacks);
         } else {
             args.push(LINTING_CFG.to_string());
+            // A test build is compiled only for `unused_pub` to see what the
+            // tests use. Its warnings are the crate's own test job's to
+            // report, from the crate's own toolchain, not this nightly's.
+            if args.iter().any(|a| a == "--test") {
+                args.extend(["--cap-lints".to_string(), "allow".to_string()]);
+            }
             if let Ok(flags) = env::var(RUSTFLAGS_ENV) {
                 args.extend(flags.split_whitespace().map(String::from));
             }
@@ -139,11 +145,12 @@ impl rustc_driver::Callbacks for MordantCallbacks {
 
 /// Inputs rustc does not see that change what the lints report, written to
 /// the dep-info file so cargo reruns a crate when one changes: the
-/// configuration and extra flags, and this binary, which a reinstall or a
-/// rebuild replaces with one carrying different lints.
+/// configuration, the extra flags, where `unused_pub` keeps its records,
+/// and this binary, which a reinstall or a rebuild replaces with one
+/// carrying different lints.
 fn track_state(sess: &Session) {
     let mut env_depinfo = sess.env_depinfo.borrow_mut();
-    for var in [CONFIG_ENV, RUSTFLAGS_ENV] {
+    for var in [CONFIG_ENV, RUSTFLAGS_ENV, FACTS_ENV] {
         env_depinfo.insert((
             Symbol::intern(var),
             env::var(var).ok().map(|value| Symbol::intern(&value)),

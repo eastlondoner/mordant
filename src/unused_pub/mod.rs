@@ -1,9 +1,14 @@
 //! Finds `pub` items that no crate in the workspace uses.
 
 mod files;
-mod workspace;
+#[allow(
+    dead_code,
+    reason = "cargo-mordant reads what this library only writes"
+)]
+mod records;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -11,14 +16,15 @@ use rustc_hir::{
     Expr, ExprKind, HirId, ImplItem, ImplItemKind, Item, ItemKind, Node, Pat, PatExpr, PatExprKind,
     PatKind, Path, QPath, TraitItem, TraitItemKind,
 };
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass, Level, LintContext};
+use rustc_middle::lint::LintLevelSource;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_span::Span;
 use rustc_structures::CrateType;
 
-use files::Def;
-use workspace::Workspace;
+use crate::protocol::FACTS_ENV;
+use records::{Def, Note, Unit};
 
 rustc_lint::declare_lint! {
     /// Finds a `pub` item that nothing in the workspace uses: no crate
@@ -40,23 +46,37 @@ rustc_lint::declare_lint! {
     /// the entry point; items produced by macros; items in a file brought
     /// in with `include!`, which is generated code as a rule.
     ///
-    /// Under `cargo check --workspace` each library records its items under
-    /// `target/mordant/unused_pub/`, and each crate the items it uses. The
-    /// findings for a library are printed while compiling the member that
-    /// nothing else depends on. A crate compiled alone is judged alone. A
-    /// use that only exists under a `cfg`, target or feature not compiled
-    /// in this run is not seen.
+    /// Under `cargo mordant` every compilation of a member records the items
+    /// it defines and the ones it uses under `target/mordant/unused_pub/`,
+    /// and the findings are printed once cargo is done, from the records of
+    /// the targets that run built, so a use counts whichever crate cargo
+    /// compiled first. With `--all-targets` that includes tests, benches and
+    /// examples, and an item only they use is used. A crate compiled without
+    /// `cargo mordant` is judged alone. A use that only exists under a `cfg`,
+    /// target or feature not compiled in this run is not seen.
     pub UNUSED_PUB,
     Warn,
     "a public item that no crate in the workspace uses"
 }
 
+/// How this compilation takes part, decided in `check_crate`.
+#[derive(Default)]
+enum Mode {
+    /// Not under `cargo mordant`, or a build script, which nothing else can
+    /// name: the crate's items are judged against its own uses.
+    #[default]
+    Alone,
+    /// Under `cargo mordant`: write this unit's records into `dir`, which
+    /// `cargo mordant` judges once the run is built.
+    Record { dir: PathBuf, unit: Unit },
+}
+
 #[derive(Default)]
 pub struct UnusedPub {
-    /// Decided in `check_crate`: `None` there means the crate is judged
-    /// alone.
-    ws: Option<Workspace>,
-    is_executable: bool,
+    mode: Mode,
+    /// Built with `--test`: its uses count, but its items are the ones the
+    /// crate's own build records, or only exist for the tests.
+    is_test: bool,
     is_proc_macro: bool,
     /// This crate's reachable `pub` items, with their local id and name
     /// span for the case where this crate prints them itself.
@@ -65,32 +85,24 @@ pub struct UnusedPub {
     /// Keys of workspace items other crates define and this crate uses.
     foreign_refs: BTreeSet<String>,
     /// Keys listed by the `.defs` files present when this crate started:
-    /// every library below it has finished by then.
+    /// every library it depends on has finished by then.
     known: HashSet<String>,
     /// The crates those keys belong to, to skip the rest cheaply.
     known_crates: HashSet<String>,
     keys: HashMap<DefId, Option<String>>,
 }
 
-rustc_lint::impl_lint_pass!(UnusedPub => [UNUSED_PUB]);
+// Declares no lint, so rustc runs it where `unused_pub` is allowed too:
+// every compilation's uses count, whatever its levels.
+rustc_lint::impl_lint_pass!(UnusedPub => []);
 
 impl<'tcx> LateLintPass<'tcx> for UnusedPub {
     fn check_crate(&mut self, cx: &LateContext<'tcx>) {
-        let types = cx.tcx.crate_types();
-        self.is_executable = types.contains(&CrateType::Executable);
-        self.is_proc_macro = types.contains(&CrateType::ProcMacro);
-        if test_build(cx) {
-            return;
-        }
-        let kind = if self.is_executable {
-            workspace::Kind::Bin
-        } else {
-            workspace::Kind::Lib
-        };
-        let name = cx.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
-        self.ws = workspace::locate(name.as_str(), kind);
-        if let Some(ws) = &self.ws {
-            self.known = files::all_def_keys(&ws.dir);
+        self.is_test = cx.tcx.sess.is_test_crate();
+        self.is_proc_macro = cx.tcx.crate_types().contains(&CrateType::ProcMacro);
+        self.mode = mode(cx);
+        if let Mode::Record { dir, .. } = &self.mode {
+            self.known = records::all_def_keys(dir);
             self.known_crates = self
                 .known
                 .iter()
@@ -184,52 +196,65 @@ impl<'tcx> LateLintPass<'tcx> for UnusedPub {
     }
 
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
-        if test_build(cx) {
-            return;
-        }
-        let name = cx.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
         let defs = std::mem::take(&mut self.defs);
-        if let Some(ws) = &self.ws {
-            let mut refs = std::mem::take(&mut self.foreign_refs);
-            refs.extend(
-                defs.iter()
-                    .filter(|(id, ..)| self.local_refs.contains(id))
-                    .map(|(.., d)| d.key.clone()),
-            );
-            files::write_refs(
-                &files::refs_path(&ws.dir, &ws.package, name.as_str(), ws.kind),
-                &refs,
-            );
-            if !self.is_executable && !self.is_proc_macro {
-                files::write_defs(
-                    &files::defs_path(&ws.dir, name.as_str()),
-                    defs.iter().map(|(.., d)| d),
+        match &self.mode {
+            Mode::Alone => {
+                if self.is_test {
+                    return;
+                }
+                let unused: Vec<&(LocalDefId, Span, Def)> = defs
+                    .iter()
+                    .filter(|(id, ..)| !self.local_refs.contains(id))
+                    .collect();
+                let keys: HashSet<&str> = unused.iter().map(|(.., d)| d.key.as_str()).collect();
+                for (_, span, def) in unused
+                    .iter()
+                    .filter(|(.., d)| !keys.contains(d.parent.as_str()))
+                {
+                    report(cx, *span, def);
+                }
+            }
+            Mode::Record { dir, unit } => {
+                let mut refs = std::mem::take(&mut self.foreign_refs);
+                // By key, so a test build's use of the crate's own items
+                // counts for the build that records them.
+                refs.extend(
+                    self.local_refs
+                        .iter()
+                        .filter(|id| cx.effective_visibilities.is_reachable(**id))
+                        .map(|id| files::key(cx.tcx, id.to_def_id())),
                 );
+                records::write_refs(&unit.refs(dir), &refs);
+                if !self.is_test && !self.is_proc_macro {
+                    let section = crate::baseline::section_name(cx);
+                    records::write_defs(&unit.defs(dir), &section, defs.iter().map(|(.., d)| d));
+                }
             }
         }
-        // Nothing can depend on a binary, a root library, or a crate
-        // compiled alone, so their own items are judged here.
-        let judges_itself = self.is_executable
-            || self
-                .ws
-                .as_ref()
-                .is_none_or(|ws| ws.reports.contains(name.as_str()));
-        if judges_itself {
-            let unused: Vec<&(LocalDefId, Span, Def)> = defs
-                .iter()
-                .filter(|(id, ..)| !self.local_refs.contains(id))
-                .collect();
-            let keys: HashSet<&str> = unused.iter().map(|(.., d)| d.key.as_str()).collect();
-            for (_, span, def) in unused
-                .iter()
-                .filter(|(.., d)| !keys.contains(d.parent.as_str()))
-            {
-                report(cx, *span, def);
-            }
-        }
-        if let Some(ws) = &self.ws {
-            report_libraries(cx, ws, name.as_str());
-        }
+    }
+}
+
+/// How this compilation takes part: `cargo mordant` sets the environment
+/// for the run's compilations and, differently, for its last one.
+fn mode(cx: &LateContext<'_>) -> Mode {
+    let Some(dir) = std::env::var_os(FACTS_ENV).map(PathBuf::from) else {
+        return Mode::Alone;
+    };
+    let name = cx.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+    let src = cx
+        .tcx
+        .sess
+        .local_crate_source_file()
+        .and_then(|f| f.local_path().map(std::path::Path::to_path_buf));
+    match src {
+        Some(src) if name.as_str() != "build_script_build" => Mode::Record {
+            dir,
+            unit: Unit {
+                src,
+                test: cx.tcx.sess.is_test_crate(),
+            },
+        },
+        _ => Mode::Alone,
     }
 }
 
@@ -242,7 +267,7 @@ impl UnusedPub {
         name: Span,
     ) {
         let hir_id = cx.tcx.local_def_id_to_hir_id(def_id);
-        if test_build(cx)
+        if self.is_test
             || item_span.from_expansion()
             || !cx.effective_visibilities.is_reachable(def_id)
             || exempt(cx, def_id)
@@ -260,6 +285,8 @@ impl UnusedPub {
         let Some((file, lo, hi)) = files::locate(cx, name) else {
             return;
         };
+        let level = spec.level().as_str().to_string();
+        let notes = level_source(cx, spec.level(), spec.src);
         let did = def_id.to_def_id();
         let crate_name = cx.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
         let mut path = with_no_trimmed_paths!(cx.tcx.def_path_str(did));
@@ -274,14 +301,13 @@ impl UnusedPub {
             descr: cx.tcx.def_descr(did).to_string(),
             path,
             parent: parent_key(cx, did).unwrap_or_default(),
+            level,
+            notes,
         };
         self.defs.push((def_id, name, def));
     }
 
     fn record_ref(&mut self, cx: &LateContext<'_>, def_id: DefId, from: HirId) {
-        if test_build(cx) {
-            return;
-        }
         // An item naming itself (recursion, its own signature) is no use.
         if from.owner.to_def_id() == def_id {
             return;
@@ -290,7 +316,7 @@ impl UnusedPub {
             self.local_refs.insert(local);
             return;
         }
-        if self.ws.is_none()
+        if !matches!(self.mode, Mode::Record { .. })
             || !self
                 .known_crates
                 .contains(cx.tcx.crate_name(def_id.krate).as_str())
@@ -308,14 +334,6 @@ impl UnusedPub {
     }
 }
 
-/// `cargo check --tests` compiles a member a second time, as a test
-/// executable: the same items again, and cargo does not order that build
-/// before the crate that prints the findings, so what its `#[cfg(test)]`
-/// code uses could not be counted on. Such a build takes no part.
-fn test_build(cx: &LateContext<'_>) -> bool {
-    cx.tcx.sess.is_test_crate()
-}
-
 /// The item a use counts for: a constructor or variant counts as its
 /// struct or enum.
 fn owning_item(cx: &LateContext<'_>, def_id: DefId) -> DefId {
@@ -323,6 +341,60 @@ fn owning_item(cx: &LateContext<'_>, def_id: DefId) -> DefId {
         DefKind::Ctor(..) => owning_item(cx, cx.tcx.parent(def_id)),
         DefKind::Variant => cx.tcx.parent(def_id),
         _ => def_id,
+    }
+}
+
+/// Where `unused_pub`'s level at an item comes from, in the words rustc puts
+/// under a lint (`explain_lint_level_source`), for `cargo mordant` to print
+/// under the finding.
+fn level_source(cx: &LateContext<'_>, level: Level, src: LintLevelSource) -> Vec<Note> {
+    let name = UNUSED_PUB.name_lower();
+    let note = |message: String| Note {
+        help: false,
+        message,
+        at: None,
+    };
+    match src {
+        LintLevelSource::Default => {
+            vec![note(format!(
+                "`#[{}({name})]` on by default",
+                level.as_str()
+            ))]
+        }
+        LintLevelSource::CommandLine(flag_value, set) => {
+            let flag = set.to_cmd_flag();
+            let hyphenated = name.replace('_', "-");
+            if flag_value.as_str() == name {
+                return vec![note(format!(
+                    "requested on the command line with `{flag} {hyphenated}`"
+                ))];
+            }
+            let group = flag_value.as_str().replace('_', "-");
+            vec![
+                note(format!("`{flag} {hyphenated}` implied by `{flag} {group}`")),
+                Note {
+                    help: true,
+                    message: format!("to override `{flag} {group}` add `#[allow({name})]`"),
+                    at: None,
+                },
+            ]
+        }
+        LintLevelSource::Node {
+            name: attr, span, ..
+        } => {
+            let mut notes = vec![Note {
+                help: false,
+                message: "the lint level is defined here".to_string(),
+                at: files::locate(cx, span),
+            }];
+            if attr.as_str() != name {
+                let level = level.as_str();
+                notes.push(note(format!(
+                    "`#[{level}({name})]` implied by `#[{level}({attr})]`"
+                )));
+            }
+            notes
+        }
     }
 }
 
@@ -426,55 +498,4 @@ fn report(cx: &LateContext<'_>, span: Span, def: &Def) {
         "remove it; if code under a `cfg`, target or feature not compiled here uses it, \
          gate the item the same way",
     );
-}
-
-/// Prints the findings of every library this crate reports for, other
-/// than itself, from the files those libraries and their users left.
-fn report_libraries(cx: &LateContext<'_>, ws: &Workspace, own: &str) {
-    let libraries: Vec<&String> = ws.reports.iter().filter(|l| l.as_str() != own).collect();
-    if libraries.is_empty() {
-        return;
-    }
-    // A library cargo did not recompile in this run is judged from the
-    // record it left earlier. One that left none (compiled before this
-    // lint existed, or the directory was removed) would make everything
-    // it uses look unused, so nothing is judged until it is recompiled.
-    let silent: Vec<String> = cx
-        .tcx
-        .crates(())
-        .iter()
-        .map(|&c| cx.tcx.crate_name(c).to_string())
-        .filter(|name| {
-            ws.libraries.get(name).is_some_and(|package| {
-                !files::refs_path(&ws.dir, package, name, workspace::Kind::Lib).exists()
-            })
-        })
-        .collect();
-    if !silent.is_empty() {
-        cx.sess().dcx().warn(format!(
-            "mordant: `unused_pub` did not judge the workspace's libraries: {} left no \
-             record of what they use; remove `{}`, which holds those records and the build \
-             `cargo mordant` reuses, then run again",
-            crate::baseline::join(&silent, "and"),
-            ws.dir.parent().unwrap_or(&ws.dir).display(),
-        ));
-        return;
-    }
-    let refs = files::all_refs(&ws.dir, &ws.members);
-    for lib in libraries {
-        let mut defs = files::read_defs(&files::defs_path(&ws.dir, lib));
-        defs.retain(|d| !refs.contains(&d.key));
-        defs.sort_by(|a, b| a.file.cmp(&b.file).then(a.lo.cmp(&b.lo)));
-        let keys: HashSet<&str> = defs.iter().map(|d| d.key.as_str()).collect();
-        for def in defs.iter().filter(|d| !keys.contains(d.parent.as_str())) {
-            match files::span_in(cx, &ws.root, &def.file, def.lo, def.hi) {
-                Some(span) => report(cx, span, def),
-                None => cx.sess().dcx().warn(format!(
-                    "mordant: {} `{}` is public, but nothing in the workspace uses it \
-                     ({} could not be read)",
-                    def.descr, def.path, def.file
-                )),
-            }
-        }
-    }
 }

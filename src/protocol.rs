@@ -15,3 +15,9 @@ pub const CONFIG_ENV: &str = "MORDANT_TOML";
 /// under a `mordant` heading, indented and as `name  level  description`:
 /// the shape `cargo dylint list` printed, which `mordant-action` parses.
 pub const LIST_ARG: &str = "--mordant-list";
+
+/// The directory where each compilation under `cargo mordant` records the
+/// `pub` items it defines and the workspace items it uses, for
+/// `unused_pub` to judge once the whole run is done. Unset, each crate is
+/// judged alone, against its own uses.
+pub const FACTS_ENV: &str = "MORDANT_UNUSED_PUB_FACTS";
