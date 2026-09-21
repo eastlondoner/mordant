@@ -240,6 +240,37 @@ fn unused_pub_matches_a_unit_tests_use_past_a_cfg_test_impl() {
     assert!(!out.contains("`demo::A::get` is public"), "{out}");
 }
 
+/// A crate that cargo compiles more than one in a run with different compile
+/// time features enabled can have different pub function usages in different
+/// builds. When checking for unused pub functions, we check all builds.
+#[test]
+fn unused_pub_checks_all_builds() {
+    let root = workspace(
+        "two_copies",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [workspace]\n\n\
+                 [[test]]\nname = \"with_unix\"\npath = \"tests/with_unix.rs\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn by_unix() {}\n\
+                pub fn by_windows() {}\n\
+                pub fn start() {\n    #[cfg(unix)]\n    by_unix();\n    \
+                #[cfg(windows)]\n    by_windows();\n}\n",
+            ),
+            ("tests/with_unix.rs", "#[test]\nfn t() { demo::start(); }\n"),
+        ],
+    );
+    let out = cargo_mordant_with(&root, &["--all-targets", "--target", "x86_64-unknown-linux-gnu", "--target", "x86_64-pc-windows-msvc"], &[("MORDANT_RUSTFLAGS", "-D warnings")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("`demo::by_unix` is public"), "{stderr}");
+    assert!(!stderr.contains("`demo::by_windows` is public"), "{stderr}");
+}
+
 /// A workspace of three members: the library `a`; the binary `b`, which
 /// depends on it; and `c`, which depends on it too and whose only target
 /// wants a feature that is off, so `--workspace` selects it and builds
