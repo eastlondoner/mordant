@@ -370,6 +370,62 @@ fn unused_pub_names_the_units_whose_records_are_missing() {
     assert!(!stderr.contains("is public, but"), "{stderr}");
 }
 
+/// Disabling unused_pub in the config means unused pub items
+/// must not fail a run and unused pub items must not be reported.
+#[test]
+fn unused_pub_disabled() {
+    let root = workspace(
+        "unused_pub_disabled",
+        &[
+            ("src/lib.rs", "pub fn unused() {}\n"),
+            ("dylint.toml", "[mordant]\ndisabled = [\"unused_pub\"]\n"),
+        ],
+    );
+    let out = cargo_mordant_with(&root, &[], &[("MORDANT_RUSTFLAGS", "-D warnings")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("is public"), "{stderr}");
+    // when unused_pub is disabled, the "did not judge" error should not be reported
+    assert!(!stderr.contains("did not judge the workspace"), "{stderr}");
+}
+
+/// Running with unused_pub enabled, then immediately disabling
+/// unused_pub in the config. In this situation, unused pub items
+/// must not be reported and must not fail a run.
+#[test]
+fn unused_pub_disabled_after_enabled() {
+    let root = workspace(
+        "unused_pub_disabled_after_enabled",
+        &[
+            ("src/lib.rs", "pub fn unused() {}\n"),
+            ("dylint.toml", "[mordant]\n"),
+        ],
+    );
+    let out = cargo_mordant_with(&root, &[], &[("MORDANT_RUSTFLAGS", "-D warnings")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("is public"), "{stderr}");
+    fs::write(
+        root.join("dylint.toml"),
+        "[mordant]\ndisabled = [\"unused_pub\"]\n",
+    )
+    .expect("write the config");
+    let out = cargo_mordant_with(&root, &[], &[("MORDANT_RUSTFLAGS", "-D warnings")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("is public"), "{stderr}");
+    // when unused_pub is disabled, the "did not judge" error should not be reported
+    assert!(!stderr.contains("did not judge the workspace"), "{stderr}");
+    // If the records are removed, the "did not judge" error should still be skipped
+    // unlike unused_pub_names_the_units_whose_records_are_missing
+    fs::remove_dir_all(root.join("target/mordant/unused_pub")).expect("remove the records");
+    let out = cargo_mordant_with(&root, &[], &[("MORDANT_RUSTFLAGS", "-D warnings")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("is public"), "{stderr}");
+    assert!(!stderr.contains("did not judge the workspace"), "{stderr}");
+}
+
 /// Test code is where the crate is exercised, not what the lints are about:
 /// a test build runs `unused_pub` alone, so a finding in a `#[cfg(test)]`
 /// module or an integration test is not reported, while the same finding
