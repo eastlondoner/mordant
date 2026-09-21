@@ -392,11 +392,36 @@ fn unit_of(message: &Json, members: &[String]) -> Option<unused_pub::RunUnit> {
         unit: records::Unit {
             src: PathBuf::from(target["src_path"].as_str()?),
             test: message["profile"]["test"].as_bool()?,
+            extra_filename: extra_filename(message)?,
         },
         package_id: package_id.to_string(),
         manifest_path: message["manifest_path"].as_str()?.to_string(),
         target: target.clone(),
     })
+}
+
+/// Cargo's `-C extra-filename` for this artifact, taken from a `.rmeta` in
+/// `filenames`.
+fn extra_filename(message: &Json) -> Option<String> {
+    let crate_name = message["target"]["name"].as_str()?.replace('-', "_");
+    let prefixes = [format!("lib{crate_name}"), crate_name];
+    for file in message["filenames"].as_array()?.iter() {
+        let Some(name) = file
+            .as_str()
+            .and_then(|p| Path::new(p).file_name()?.to_str())
+        else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".rmeta") else {
+            continue;
+        };
+        for prefix in &prefixes {
+            if let Some(extra) = stem.strip_prefix(prefix.as_str()) {
+                return Some(extra.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The exit status of the program this run hands over to, as its own.

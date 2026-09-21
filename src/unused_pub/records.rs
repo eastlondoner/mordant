@@ -77,12 +77,15 @@ pub struct Defs {
     pub defs: Vec<Def>,
 }
 
-/// One compilation cargo runs: a target's crate root, and whether it is
-/// built as a test harness. `cargo mordant` names the same units from
-/// cargo's own report of the run.
+/// One compilation cargo runs: a target's crate root, whether it is built as
+/// a test harness, and cargo's `-C extra-filename` for that unit.
+/// `cargo mordant` names the same units from cargo's own report of the run.
 pub struct Unit {
     pub src: PathBuf,
     pub test: bool,
+    /// Required so that two compiles of the same crate root (e.g. targeting
+    /// different platforms) do not overwrite the same `.refs` and `.defs` files.
+    pub extra_filename: String,
 }
 
 impl Unit {
@@ -93,6 +96,7 @@ impl Unit {
         let mut hasher = DefaultHasher::new();
         src.hash(&mut hasher);
         self.test.hash(&mut hasher);
+        self.extra_filename.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
 

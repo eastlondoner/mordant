@@ -240,8 +240,8 @@ fn unused_pub_matches_a_unit_tests_use_past_a_cfg_test_impl() {
     assert!(!out.contains("`demo::A::get` is public"), "{out}");
 }
 
-/// A crate that cargo compiles more than once with can have different pub 
-// function usages in different builds. Adding an integration test makes 
+/// A crate that cargo compiles more than once with can have different pub
+// function usages in different builds. Adding an integration test makes
 /// cargo compile with panic = "unwind" when --all-targets is used.
 /// When checking for unused pub functions, we must check all builds.
 #[test]
