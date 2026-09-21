@@ -254,6 +254,7 @@ fn mode(cx: &LateContext<'_>) -> Mode {
             unit: Unit {
                 src,
                 test: cx.tcx.sess.is_test_crate(),
+                extra_filename: cx.tcx.sess.opts.cg.extra_filename.clone(),
             },
         },
         _ => Mode::Alone,

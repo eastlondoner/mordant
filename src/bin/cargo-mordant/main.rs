@@ -392,10 +392,27 @@ fn unit_of(message: &Json, members: &[String]) -> Option<unused_pub::RunUnit> {
         unit: records::Unit {
             src: PathBuf::from(target["src_path"].as_str()?),
             test: message["profile"]["test"].as_bool()?,
+            extra_filename: extra_filename(message)?,
         },
         package_id: package_id.to_string(),
         manifest_path: message["manifest_path"].as_str()?.to_string(),
         target: target.clone(),
+    })
+}
+
+/// Cargo's `-C extra-filename` for this artifact, read off the name of any
+/// file it lists: `libdemo-<hash>.rmeta`, or `libdemo_macros-<hash>.dylib`
+/// for a proc-macro cargo builds in full for a dependent and never checks.
+fn extra_filename(message: &Json) -> Option<String> {
+    let crate_name = message["target"]["name"].as_str()?.replace('-', "_");
+    let prefixes = [format!("lib{crate_name}"), crate_name];
+    message["filenames"].as_array()?.iter().find_map(|file| {
+        let name = Path::new(file.as_str()?).file_name()?.to_str()?;
+        prefixes.iter().find_map(|prefix| {
+            // The hash runs to the first `.`: `.rmeta`, `.so`, `.dll.lib`.
+            let (extra, _) = name.strip_prefix(prefix.as_str())?.split_once('.')?;
+            (extra.is_empty() || extra.starts_with('-')).then(|| extra.to_string())
+        })
     })
 }
 

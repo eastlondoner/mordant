@@ -240,6 +240,83 @@ fn unused_pub_matches_a_unit_tests_use_past_a_cfg_test_impl() {
     assert!(!out.contains("`demo::A::get` is public"), "{out}");
 }
 
+/// A crate that cargo compiles more than once with can have different pub
+// function usages in different builds. Adding an integration test makes
+/// cargo compile with panic = "unwind" when --all-targets is used.
+/// When checking for unused pub functions, we must check all builds.
+#[test]
+fn unused_pub_unions_uses_from_abort_and_unwind_builds() {
+    let root = workspace(
+        "abort_and_unwind_builds",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [workspace]\n\n\
+                 [profile.dev]\npanic = \"abort\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn by_abort() {}\n\
+                 pub fn by_unwind() {}\n\
+                 pub fn start() {\n    #[cfg(panic = \"abort\")]\n    by_abort();\n    \
+                 #[cfg(panic = \"unwind\")]\n    by_unwind();\n}\n",
+            ),
+            ("tests/it.rs", "#[test]\nfn t() { demo::start(); }\n"),
+        ],
+    );
+    let out = cargo_mordant_with(
+        &root,
+        &["--all-targets"],
+        &[("MORDANT_RUSTFLAGS", "-D warnings")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("`demo::by_abort` is public"), "{stderr}");
+    assert!(!stderr.contains("`demo::by_unwind` is public"), "{stderr}");
+}
+
+/// A crate that cargo compiles more than once in a run with different compile
+/// time targets enabled can have different pub function usages in different
+/// builds. When checking for unused pub functions, we must check all builds.
+#[test]
+fn unused_pub_checks_all_builds() {
+    let root = workspace(
+        "two_build_targets",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [workspace]\n\n\
+                 [[test]]\nname = \"with_unix\"\npath = \"tests/start.rs\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn by_unix() {}\n\
+                pub fn by_windows() {}\n\
+                pub fn start() {\n    #[cfg(unix)]\n    by_unix();\n    \
+                #[cfg(windows)]\n    by_windows();\n}\n",
+            ),
+            ("tests/start.rs", "#[test]\nfn t() { demo::start(); }\n"),
+        ],
+    );
+    let out = cargo_mordant_with(
+        &root,
+        &[
+            "--all-targets",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--target",
+            "x86_64-pc-windows-msvc",
+        ],
+        &[("MORDANT_RUSTFLAGS", "-D warnings")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("`demo::by_unix` is public"), "{stderr}");
+    assert!(!stderr.contains("`demo::by_windows` is public"), "{stderr}");
+}
+
 /// A workspace of three members: the library `a`; the binary `b`, which
 /// depends on it; and `c`, which depends on it too and whose only target
 /// wants a feature that is off, so `--workspace` selects it and builds
@@ -518,4 +595,64 @@ fn unused_pub_reports_a_level_set_in_the_source() {
         stderr.contains("note: the lint level is defined here"),
         "{stderr}"
     );
+}
+
+/// A proc-macro another member expands is built in full, as a `.dylib` or
+/// `.so` with no `.rmeta` beside it, and under `-p` cargo builds nothing
+/// else of it. That build is still a unit of the run: what the macro's code
+/// uses counts, and the library it uses is judged.
+#[test]
+fn unused_pub_counts_a_proc_macro_built_only_for_its_dependent() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proc_macro");
+    let _ = fs::remove_dir_all(&root);
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{rest}")
+    };
+    let files = [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"demo\", \"demo_macros\", \"app\"]\nresolver = \"2\"\n"
+                .to_string(),
+        ),
+        ("demo/Cargo.toml", package("demo", "")),
+        (
+            "demo/src/lib.rs",
+            "pub fn used_by_macro() {}\n\npub fn unused() {}\n".to_string(),
+        ),
+        (
+            "demo_macros/Cargo.toml",
+            package(
+                "demo_macros",
+                "[lib]\nproc-macro = true\n\n[dependencies]\ndemo = { path = \"../demo\" }\n",
+            ),
+        ),
+        (
+            "demo_macros/src/lib.rs",
+            "use proc_macro::TokenStream;\n\n#[proc_macro]\n\
+             pub fn m(input: TokenStream) -> TokenStream {\n    demo::used_by_macro();\n    input\n}\n"
+                .to_string(),
+        ),
+        (
+            "app/Cargo.toml",
+            package("app", "[dependencies]\ndemo_macros = { path = \"../demo_macros\" }\n"),
+        ),
+        (
+            "app/src/main.rs",
+            "fn main() {\n    demo_macros::m!();\n}\n".to_string(),
+        ),
+    ];
+    for (path, text) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().expect("a file in the workspace"))
+            .expect("create the member");
+        fs::write(path, text).expect("write a workspace file");
+    }
+    for run in [&["-p", "app", "-p", "demo"][..], &["--workspace"][..]] {
+        let out = stderr(&cargo_mordant_with(&root, run, &[]));
+        assert!(out.contains("`demo::unused` is public"), "{run:?}: {out}");
+        assert!(
+            !out.contains("`demo::used_by_macro` is public"),
+            "{run:?}: {out}"
+        );
+    }
 }

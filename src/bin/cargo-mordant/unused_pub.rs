@@ -91,6 +91,7 @@ fn judge<'a>(facts: &Path, units: &'a [RunUnit], judged: &HashSet<&str>) -> Reco
             let plain = Unit {
                 src: unit.src.clone(),
                 test: false,
+                extra_filename: unit.extra_filename.clone(),
             };
             if unit.test {
                 records::read_refs(&plain.refs(facts))
