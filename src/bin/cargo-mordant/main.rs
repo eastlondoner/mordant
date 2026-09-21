@@ -400,28 +400,20 @@ fn unit_of(message: &Json, members: &[String]) -> Option<unused_pub::RunUnit> {
     })
 }
 
-/// Cargo's `-C extra-filename` for this artifact, taken from a `.rmeta` in
-/// `filenames`.
+/// Cargo's `-C extra-filename` for this artifact, read off the name of any
+/// file it lists: `libdemo-<hash>.rmeta`, or `libdemo_macros-<hash>.dylib`
+/// for a proc-macro cargo builds in full for a dependent and never checks.
 fn extra_filename(message: &Json) -> Option<String> {
     let crate_name = message["target"]["name"].as_str()?.replace('-', "_");
     let prefixes = [format!("lib{crate_name}"), crate_name];
-    for file in message["filenames"].as_array()?.iter() {
-        let Some(name) = file
-            .as_str()
-            .and_then(|p| Path::new(p).file_name()?.to_str())
-        else {
-            continue;
-        };
-        let Some(stem) = name.strip_suffix(".rmeta") else {
-            continue;
-        };
-        for prefix in &prefixes {
-            if let Some(extra) = stem.strip_prefix(prefix.as_str()) {
-                return Some(extra.to_string());
-            }
-        }
-    }
-    None
+    message["filenames"].as_array()?.iter().find_map(|file| {
+        let name = Path::new(file.as_str()?).file_name()?.to_str()?;
+        prefixes.iter().find_map(|prefix| {
+            // The hash runs to the first `.`: `.rmeta`, `.so`, `.dll.lib`.
+            let (extra, _) = name.strip_prefix(prefix.as_str())?.split_once('.')?;
+            (extra.is_empty() || extra.starts_with('-')).then(|| extra.to_string())
+        })
+    })
 }
 
 /// The exit status of the program this run hands over to, as its own.

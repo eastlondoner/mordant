@@ -596,3 +596,63 @@ fn unused_pub_reports_a_level_set_in_the_source() {
         "{stderr}"
     );
 }
+
+/// A proc-macro another member expands is built in full, as a `.dylib` or
+/// `.so` with no `.rmeta` beside it, and under `-p` cargo builds nothing
+/// else of it. That build is still a unit of the run: what the macro's code
+/// uses counts, and the library it uses is judged.
+#[test]
+fn unused_pub_counts_a_proc_macro_built_only_for_its_dependent() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proc_macro");
+    let _ = fs::remove_dir_all(&root);
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{rest}")
+    };
+    let files = [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"demo\", \"demo_macros\", \"app\"]\nresolver = \"2\"\n"
+                .to_string(),
+        ),
+        ("demo/Cargo.toml", package("demo", "")),
+        (
+            "demo/src/lib.rs",
+            "pub fn used_by_macro() {}\n\npub fn unused() {}\n".to_string(),
+        ),
+        (
+            "demo_macros/Cargo.toml",
+            package(
+                "demo_macros",
+                "[lib]\nproc-macro = true\n\n[dependencies]\ndemo = { path = \"../demo\" }\n",
+            ),
+        ),
+        (
+            "demo_macros/src/lib.rs",
+            "use proc_macro::TokenStream;\n\n#[proc_macro]\n\
+             pub fn m(input: TokenStream) -> TokenStream {\n    demo::used_by_macro();\n    input\n}\n"
+                .to_string(),
+        ),
+        (
+            "app/Cargo.toml",
+            package("app", "[dependencies]\ndemo_macros = { path = \"../demo_macros\" }\n"),
+        ),
+        (
+            "app/src/main.rs",
+            "fn main() {\n    demo_macros::m!();\n}\n".to_string(),
+        ),
+    ];
+    for (path, text) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().expect("a file in the workspace"))
+            .expect("create the member");
+        fs::write(path, text).expect("write a workspace file");
+    }
+    for run in [&["-p", "app", "-p", "demo"][..], &["--workspace"][..]] {
+        let out = stderr(&cargo_mordant_with(&root, run, &[]));
+        assert!(out.contains("`demo::unused` is public"), "{run:?}: {out}");
+        assert!(
+            !out.contains("`demo::used_by_macro` is public"),
+            "{run:?}: {out}"
+        );
+    }
+}
