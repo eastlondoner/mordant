@@ -14,6 +14,9 @@ extern crate rustc_interface;
 extern crate rustc_session;
 extern crate rustc_span;
 
+// Override the C allocator in the same way that the `rustc` binary would do.
+rustc_driver::override_c_allocator_in_binary!();
+
 use std::env;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};

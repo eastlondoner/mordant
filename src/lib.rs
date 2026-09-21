@@ -14,6 +14,7 @@ extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 
 use rustc_data_structures::sync;
 
@@ -367,7 +368,8 @@ impl Registrar<'_> {
         let run = enabled && !all_disabled(&names, self.disabled);
         self.known.extend(names);
         if run {
-            self.store.register_late_pass(move |_| Box::new(make()));
+            self.store
+                .register_late_lint_pass(Box::new(move |_| Box::new(make())));
         }
     }
 

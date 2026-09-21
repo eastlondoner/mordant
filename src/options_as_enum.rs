@@ -11,7 +11,7 @@ use rustc_span::{Span, Symbol};
 
 use crate::MordantConfig;
 
-rustc_session::declare_lint! {
+rustc_lint::declare_lint! {
     /// Flags a struct whose `Option` fields are alternatives: none of the
     /// places it is built sets more than one of them to `Some`, but the
     /// struct allows both at once. One enum field with a variant per case
@@ -39,7 +39,7 @@ pub struct OptionsAsEnum {
     structs: HashMap<DefId, Facts>,
 }
 
-rustc_session::impl_lint_pass!(OptionsAsEnum => [OPTIONS_AS_ENUM]);
+rustc_lint::impl_lint_pass!(OptionsAsEnum => [OPTIONS_AS_ENUM]);
 
 impl OptionsAsEnum {
     pub fn new(config: &MordantConfig) -> Self {
@@ -89,9 +89,9 @@ impl<'tcx> LateLintPass<'tcx> for OptionsAsEnum {
                     if !opts.contains(&field.ident.name) {
                         continue;
                     }
-                    if clippy_utils::as_some_expr(cx, field.expr).is_some() {
+                    if crate::hir_shapes::as_some_expr(cx, field.expr).is_some() {
                         somes.push(field.ident.name);
-                    } else if !clippy_utils::is_none_expr(cx, field.expr) {
+                    } else if !crate::hir_shapes::is_none_expr(cx, field.expr) {
                         facts.unprovable = true;
                         return;
                     }
@@ -117,7 +117,10 @@ impl<'tcx> LateLintPass<'tcx> for OptionsAsEnum {
     }
 
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
-        for (did, facts) in &self.structs {
+        let mut structs: Vec<(&DefId, &Facts)> = self.structs.iter().collect();
+        // Deterministic order: findings are compared against a baseline.
+        structs.sort_by_key(|(did, _)| cx.tcx.def_span(**did));
+        for (did, facts) in structs {
             if facts.unprovable || facts.sites.len() < 2 {
                 continue;
             }

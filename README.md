@@ -119,8 +119,8 @@ Mordant runs against stable Rust projects. The lints are built with a pinned nig
 Install the nightly and mordant's two binaries, `cargo-mordant` and `mordant-driver`:
 
 ```sh
-rustup toolchain install nightly-2026-05-28 --component rustc-dev --component llvm-tools-preview
-cargo +nightly-2026-05-28 install --locked --git https://github.com/scarletindustries/mordant
+rustup toolchain install nightly-2026-09-01 --component rustc-dev --component llvm-tools-preview
+cargo +nightly-2026-09-01 install --locked --git https://github.com/scarletindustries/mordant
 ```
 
 Add `--rev <commit>` to pin the lints, so they change only when you move the pin. `cargo mordant --version` prints the commit a build came from, and `cargo mordant --list` every lint in it.
