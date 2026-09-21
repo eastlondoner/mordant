@@ -76,6 +76,46 @@ fn dylint_toml_is_read_and_a_change_to_it_rechecks() {
     assert!(removed.contains("#[warn(discarded_error)]"), "{removed}");
 }
 
+/// The baseline is an input of every compilation too. A run that writes it
+/// reruns the lints on a crate cargo would otherwise have left alone, and so
+/// does a change to the file.
+#[test]
+fn a_baseline_write_and_a_change_to_the_baseline_recheck() {
+    let root = workspace(
+        "baseline_inputs",
+        &[
+            ("src/main.rs", MAIN),
+            (
+                "dylint.toml",
+                "[mordant]\nbaseline = \"mordant-baseline.toml\"\n",
+            ),
+        ],
+    );
+    let unheld = stderr(&cargo_mordant(&root));
+    assert!(unheld.contains("#[warn(discarded_error)]"), "{unheld}");
+
+    stderr(&cargo_mordant_with(
+        &root,
+        &[],
+        &[("MORDANT_BASELINE_WRITE", "1")],
+    ));
+    let baseline =
+        fs::read_to_string(root.join("mordant-baseline.toml")).expect("baseline written");
+    assert!(
+        baseline.contains("\"discarded_error:src/main.rs\" = 1"),
+        "{baseline}"
+    );
+    let held = stderr(&cargo_mordant(&root));
+    assert!(!held.contains("discarded_error"), "{held}");
+
+    fs::write(root.join("mordant-baseline.toml"), "").expect("empty the baseline");
+    let over = stderr(&cargo_mordant(&root));
+    assert!(
+        over.contains("`discarded_error` over the mordant baseline (0 recorded for src/main.rs)"),
+        "{over}"
+    );
+}
+
 /// `mordant-action` reads lint names off this, one indented
 /// `name  level  description` line per lint under a `mordant` heading.
 #[test]
@@ -178,6 +218,90 @@ fn unused_pub_counts_what_tests_use_when_they_are_built() {
     }
 }
 
+/// A `cfg(test)` impl block gives the impl blocks after it one number in the
+/// test build and another in the crate's own build. A unit test's use still
+/// counts for the method it calls, and not for the method of the same name
+/// in the next impl block.
+#[test]
+fn unused_pub_matches_a_unit_tests_use_past_a_cfg_test_impl() {
+    let root = workspace(
+        "cfg_test_impl",
+        &[(
+            "src/lib.rs",
+            "pub struct A;\n\n#[cfg(test)]\nimpl A {\n    fn only_in_tests(&self) {}\n}\n\n\
+             impl A {\n    pub fn get(&self) -> B {\n        B\n    }\n}\n\n\
+             pub struct B;\n\nimpl B {\n    pub fn get(&self) {}\n}\n\n\
+             #[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
+             super::A.only_in_tests();\n        let _ = super::A.get();\n    }\n}\n",
+        )],
+    );
+    let out = stderr(&cargo_mordant_with(&root, &["--all-targets"], &[]));
+    assert!(out.contains("`demo::B::get` is public"), "{out}");
+    assert!(!out.contains("`demo::A::get` is public"), "{out}");
+}
+
+/// A workspace of three members: the library `a`; the binary `b`, which
+/// depends on it; and `c`, which depends on it too and whose only target
+/// wants a feature that is off, so `--workspace` selects it and builds
+/// nothing of it.
+fn members(name: &str, a_lib: &str, b_main: &str) -> PathBuf {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&root);
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{rest}")
+    };
+    let on_a = "[dependencies]\na = { path = \"../a\" }\n";
+    let files = [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n".to_string(),
+        ),
+        ("a/Cargo.toml", package("a", "")),
+        ("a/src/lib.rs", a_lib.to_string()),
+        ("b/Cargo.toml", package("b", on_a)),
+        ("b/src/main.rs", b_main.to_string()),
+        (
+            "c/Cargo.toml",
+            package(
+                "c",
+                &format!(
+                    "[features]\nextra = []\n\n[[bin]]\nname = \"c\"\npath = \"src/main.rs\"\n\
+                     required-features = [\"extra\"]\n\n{on_a}"
+                ),
+            ),
+        ),
+        ("c/src/main.rs", "fn main() {}\n".to_string()),
+    ];
+    for (path, text) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().expect("a file in the workspace"))
+            .expect("create the member");
+        fs::write(path, text).expect("write a workspace file");
+    }
+    root
+}
+
+/// A run of part of the workspace cannot see what the rest of it uses, so it
+/// leaves alone a member that something outside the run depends on. A run
+/// of the whole workspace judges it, also when it builds nothing of one of
+/// its dependents.
+#[test]
+fn unused_pub_judges_a_member_only_with_its_dependents_in_the_run() {
+    let root = members(
+        "partial",
+        "pub fn by_b() {}\n\npub fn by_nothing() {}\n",
+        "fn main() {\n    a::by_b();\n}\n",
+    );
+    for run in [&["-p", "a"][..], &["--workspace", "--exclude", "b"][..]] {
+        let out = stderr(&cargo_mordant_with(&root, run, &[]));
+        assert!(!out.contains("is public, but"), "{run:?}: {out}");
+    }
+
+    let whole = stderr(&cargo_mordant_with(&root, &["--workspace"], &[]));
+    assert!(whole.contains("`a::by_nothing` is public"), "{whole}");
+    assert!(!whole.contains("`a::by_b` is public"), "{whole}");
+}
+
 /// Asked for JSON, cargo's messages come through and the findings arrive as
 /// cargo would have printed them, for the package whose file they are in.
 #[test]
@@ -227,15 +351,23 @@ fn unused_pub_findings_fail_the_run_under_deny_warnings() {
 
 /// A unit cargo does not rebuild is judged from what it recorded before;
 /// with those records gone, `unused_pub` says so instead of calling
-/// everything unused.
+/// everything unused, and the run fails: it judged nothing, which is not the
+/// same as finding nothing.
 #[test]
 fn unused_pub_names_the_units_whose_records_are_missing() {
     let root = tested("missing");
-    stderr(&cargo_mordant(&root));
+    stderr(&cargo_mordant_with(&root, &["--all-targets"], &[]));
     fs::remove_dir_all(root.join("target/mordant/unused_pub")).expect("remove the records");
-    let out = stderr(&cargo_mordant(&root));
-    assert!(out.contains("did not judge the workspace"), "{out}");
-    assert!(!out.contains("is public, but"), "{out}");
+    let out = cargo_mordant_with(&root, &["--all-targets"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("error: mordant: `unused_pub` did not judge the workspace"),
+        "{stderr}"
+    );
+    // Named once, though the run built it twice: on its own and as a test.
+    assert_eq!(stderr.matches("`src/lib.rs`").count(), 1, "{stderr}");
+    assert!(!stderr.contains("is public, but"), "{stderr}");
 }
 
 /// Test code is where the crate is exercised, not what the lints are about:
