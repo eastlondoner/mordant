@@ -241,18 +241,18 @@ fn unused_pub_matches_a_unit_tests_use_past_a_cfg_test_impl() {
 }
 
 /// A crate that cargo compiles more than one in a run with different compile
-/// time features enabled can have different pub function usages in different
-/// builds. When checking for unused pub functions, we check all builds.
+/// time targets enabled can have different pub function usages in different
+/// builds. When checking for unused pub functions, we must check all builds.
 #[test]
 fn unused_pub_checks_all_builds() {
     let root = workspace(
-        "two_copies",
+        "two_build_targets",
         &[
             (
                 "Cargo.toml",
                 "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
                  [workspace]\n\n\
-                 [[test]]\nname = \"with_unix\"\npath = \"tests/with_unix.rs\"\n",
+                 [[test]]\nname = \"with_unix\"\npath = \"tests/start.rs\"\n",
             ),
             (
                 "src/lib.rs",
@@ -261,7 +261,7 @@ fn unused_pub_checks_all_builds() {
                 pub fn start() {\n    #[cfg(unix)]\n    by_unix();\n    \
                 #[cfg(windows)]\n    by_windows();\n}\n",
             ),
-            ("tests/with_unix.rs", "#[test]\nfn t() { demo::start(); }\n"),
+            ("tests/start.rs", "#[test]\nfn t() { demo::start(); }\n"),
         ],
     );
     let out = cargo_mordant_with(&root, &["--all-targets", "--target", "x86_64-unknown-linux-gnu", "--target", "x86_64-pc-windows-msvc"], &[("MORDANT_RUSTFLAGS", "-D warnings")]);
